@@ -1,385 +1,257 @@
-/* 
- * rkspotter
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * rkspotter - RISC-V/Linux 6.x port of the rootkit-spotter module.
  *
- * Copyright (c) 2020 linuxthor.
- * 
- * This program is free software: you can redistribute it and/or modify  
- * it under the terms of the GNU General Public License as published by  
- * the Free Software Foundation, version 3. Or give it to the rag and 
- * bone man because I love eels.
- *
- * This program is distributed in the hope that it will be useful, but 
- * WITHOUT ANY WARRANTY; without even the implied warranty of your 
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License 
- * along with this program. If not, see <http://www.gnu.org/licenses/>
+ * The original detector walked the module virtual-address range looking for
+ * modules that had disappeared from the public module list.  Keep that model,
+ * but use the split module-memory layout introduced in Linux 6.4 and execute
+ * the scan through the common IEE security-tool interface.
  */
 
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/fs.h>
-#include <linux/mm.h>
-#include <linux/uio.h>  
-#include <linux/namei.h>
-#include <linux/mount.h>
-#include <linux/slab.h>
-#include <linux/vmalloc.h>
-#include <linux/uaccess.h>
-#include <linux/pagemap.h>
+#include <linux/iee_security.h>
 #include <linux/kprobes.h>
-#include <linux/sched/task.h>
+#include <linux/list.h>
+#include <linux/module.h>
+#include <linux/poison.h>
+#include <linux/sizes.h>
+#include <linux/string.h>
 
-// sys_call_table
-unsigned long *sct;
-// __access_remote_vm 
-static int (*arvm)(struct task_struct *tsk, struct mm_struct *mm, unsigned long addr, 
-                                                          void *buf, int len, int write);
- 
-void *memsrch(const void *s1, size_t len1, const void *s2, size_t len2)
-{
-    if (!len2)
-    {
-        return (void *)s1;
-    }
-    while (len1 >= len2) 
-    {
-        len1--;
-        if (!memcmp(s1, s2, len2))
-        {
-            return (void *)s1;
-        }
-        s1++;
-    }
-    return NULL;
-}
+typedef struct module *(*module_address_fn_t)(unsigned long addr);
 
-// I think this is a pretty unclean way to get this information but the code is small ;) 
-int get_filesz_by_path(const char *pathname)
-{
-    struct path path;
-    struct inode *inode;
-    int size;
+static module_address_fn_t module_address_fn;
+static unsigned long scan_runs;
+static unsigned long suspect_modules;
 
-    size=-1;
-    if (kern_path(pathname, 0, &path) == 0)
-    {
-        inode = path.dentry->d_inode;
-        size = inode->i_size;
-        mark_inode_dirty_sync(inode);
-        path_put(&path);
-    }
-    return size;
-}
-
-static struct kprobe sct_kp = { 
+struct encoded_signature {
+	const u8 *data;
+	u8 len;
 };
-unsigned long *kprobe_find_sct(void)
-{
-    unsigned long *table; 
 
-    sct_kp.symbol_name = "sys_call_table";
-    register_kprobe(&sct_kp);
-    table = (void *)sct_kp.addr;
-    if(table != 0)
-    {
-        //printk("rks: sys_call_table at %px\n",(void *)table);
-    } 
-    else
-    {
-        //printk("rks: sys_call_table not found\n"); 
-    }
-    return table;
-}
-
-static struct kprobe arvm_kp = { 
+static const u8 signature_0[] = {
+	0x8a, 0xd7, 0xc0, 0xd5, 0xd1, 0xcc, 0xc9, 0xc0, 0x8a, 0xd7, 0xc0, 0xd5, 0xd1, 0xcc, 0xc9, 0xc0,
 };
-unsigned long *kprobe_find_arvm(void)
-{
-    unsigned long *access_rem_vm; 
+static const u8 signature_1[] = {
+	0xee, 0xed, 0xea, 0xea, 0xee, 0xfa,
+};
+static const u8 signature_2[] = {
+	0xcc, 0xd6, 0xfa, 0xd5, 0xd7, 0xca, 0xc6, 0xfa, 0xcc, 0xcb, 0xd3, 0xcc, 0xd6, 0xcc, 0xc7, 0xc9, 0xc0,
+};
+static const u8 signature_3[] = {
+	0xf7, 0xea, 0xea, 0xf1, 0xee, 0xec, 0xf1, 0x85, 0xd6, 0xdc, 0xd6, 0xc6, 0xc4, 0xc9, 0xc9, 0xfa, 0xd1, 0xc4, 0xc7, 0xc9, 0xc0,
+};
+static const u8 signature_4[] = {
+	0xf7, 0xea, 0xea, 0xf1, 0xee, 0xec, 0xf1, 0x85, 0xd6, 0xdc, 0xd6, 0xfa, 0xc6, 0xc4, 0xc9, 0xc9, 0xfa, 0xd1, 0xc4, 0xc7, 0xc9, 0xc0,
+};
+static const u8 signature_5[] = {
+	0xd0, 0xcb, 0xfa, 0xcd, 0xcc, 0xcf, 0xc4, 0xc6, 0xce, 0xfa, 0xc0, 0xdd, 0xc0, 0xc6, 0xd3, 0xc0,
+};
+static const u8 signature_6[] = {
+	0xe2, 0xcc, 0xd3, 0xcc, 0xcb, 0xc2, 0x85, 0xd7, 0x95, 0x95, 0xd1,
+};
+static const u8 signature_7[] = {
+	0xe0, 0xdd, 0xc4, 0xc8, 0xd5, 0xc9, 0xc0, 0x85, 0xf7, 0xca, 0xca, 0xd1, 0xce, 0xcc, 0xd1,
+};
+static const u8 signature_8[] = {
+	0xc2, 0xcc, 0xd3, 0xc0, 0xc8, 0xc0, 0xd7, 0xca, 0xca, 0xd1,
+};
+static const u8 signature_9[] = {
+	0xc9, 0xcc, 0xc9, 0xdc, 0xca, 0xc3, 0xd1, 0xcd, 0xc0, 0xd3, 0xc4, 0xc9, 0xc9, 0xc0, 0xdc,
+};
+static const u8 signature_10[] = {
+	0xc1, 0xcc, 0xc4, 0xc8, 0xca, 0xd7, 0xd5, 0xcd, 0xcc, 0xcb, 0xc0, 0xfa,
+};
+static const u8 signature_11[] = {
+	0xe9, 0xee, 0xe8, 0x85, 0xd7, 0xca, 0xca, 0xd1, 0xce, 0xcc, 0xd1,
+};
+static const u8 signature_12[] = {
+	0xfa, 0xc7, 0xc4, 0xc6, 0xce, 0xc1, 0xca, 0xca, 0xd7, 0xfa, 0xd0, 0xd6, 0xc0, 0xd7,
+};
+static const u8 signature_13[] = {
+	0x8a, 0xc0, 0xd1, 0xc6, 0x8a, 0xd6, 0xc0, 0xc6, 0xd7, 0xc0, 0xd1, 0xd6, 0xcd, 0xc4, 0xc1, 0xca, 0xd2,
+};
+static const u8 signature_14[] = {
+	0xcd, 0xcc, 0xc1, 0xc0, 0x85, 0xd5, 0xcc, 0xc1, 0x85, 0xc6, 0xca, 0xc8, 0xc8, 0xc4, 0xcb, 0xc1,
+};
+static const u8 signature_15[] = {
+	0xc8, 0xca, 0xc1, 0xd0, 0xc9, 0xc0, 0xfa, 0xcd, 0xcc, 0xc1, 0xc0,
+};
+static const u8 signature_16[] = {
+	0xd7, 0x95, 0x95, 0xd1, 0xce, 0xcc, 0xd1,
+};
+static const u8 signature_17[] = {
+	0xd7, 0x95, 0x95, 0xd1, 0xce, 0x94, 0xd1,
+};
 
-    arvm_kp.symbol_name = "__access_remote_vm";
-    if(register_kprobe(&arvm_kp) == 0)
-             unregister_kprobe(&arvm_kp); 
-    access_rem_vm = (void *)arvm_kp.addr;
-    if(access_rem_vm != 0)
-    {
-        //printk("rks: __access_remote_vm at %px\n",(void *)access_rem_vm);
-    } 
-    else
-    {
-        //printk("rks: __access_remote_vm not found\n"); 
-    }
-    return access_rem_vm;
+static const struct encoded_signature suspicious_signatures[] = {
+	{ signature_0, ARRAY_SIZE(signature_0) },
+	{ signature_1, ARRAY_SIZE(signature_1) },
+	{ signature_2, ARRAY_SIZE(signature_2) },
+	{ signature_3, ARRAY_SIZE(signature_3) },
+	{ signature_4, ARRAY_SIZE(signature_4) },
+	{ signature_5, ARRAY_SIZE(signature_5) },
+	{ signature_6, ARRAY_SIZE(signature_6) },
+	{ signature_7, ARRAY_SIZE(signature_7) },
+	{ signature_8, ARRAY_SIZE(signature_8) },
+	{ signature_9, ARRAY_SIZE(signature_9) },
+	{ signature_10, ARRAY_SIZE(signature_10) },
+	{ signature_11, ARRAY_SIZE(signature_11) },
+	{ signature_12, ARRAY_SIZE(signature_12) },
+	{ signature_13, ARRAY_SIZE(signature_13) },
+	{ signature_14, ARRAY_SIZE(signature_14) },
+	{ signature_15, ARRAY_SIZE(signature_15) },
+	{ signature_16, ARRAY_SIZE(signature_16) },
+	{ signature_17, ARRAY_SIZE(signature_17) },
+};
+
+static void decode_signature(const struct encoded_signature *encoded,
+			     char *decoded)
+{
+	int i;
+
+	for (i = 0; i < encoded->len; i++)
+		decoded[i] = encoded->data[i] ^ 0xa5;
+	decoded[encoded->len] = '\0';
 }
 
-int lkm_code_check(unsigned long *addr, int len)
+static void *rkspotter_resolve(const char *name)
 {
-    // code signatures.. 
-    //
-    // 0f 22 c0            mov    %rax,%cr0
-    char cr0_rax[3] = {'\x0f','\x22','\xc0'};
+	struct kprobe probe = { .symbol_name = name };
+	void *address;
 
-    if(memsrch(addr, len, cr0_rax, 3) != 0)
-    {
-        return -1; 
-    }
-    return 0; 
+	if (register_kprobe(&probe))
+		return NULL;
+	address = probe.addr;
+	unregister_kprobe(&probe);
+	return address;
 }
 
-int lkm_data_check(unsigned long *addr, int len)
+static bool rkspotter_mem_contains(const void *base, size_t size,
+				   const char *needle)
 {
-    int x;
+	size_t needle_len = strlen(needle);
+	const u8 *memory = base;
+	size_t offset;
 
-    // data signatures..
-    //
-    char *data_str[24] = {
-    // strings associated with (unmodified) reptile rootkit    
-      "/reptile/reptile","KHOOK_","is_proc_invisible",
-    // strings associated with (unmodified) rootfoo rootkit
-      "ROOTKIT syscall_table", "ROOTKIT sys_call_table", "un_hijack_execve",
-    // strings associated with (unmodified) sutekh rootkit
-      "Giving r00t", "[?] SCT:", "Example Rootkit",
-    // strings associated with (unmodified) lilyofthevalley rootkit
-      "givemeroot"," lilyofthevalley"," u want to hide",
-    // strings associated with (unmodified) diamorphine rootkit
-      "diamorphine_","m0nad","LKM rootkit",
-    // strings associated with (unmodified) honeypot bears rootkit
-      "_backdoor_user","/home/haxor","/etc/secretshadow",
-    // strings associated with (unmodified) nuk3gh0stbeta rootkit
-      "hide pid command","hide file command","asm_hook_remove_all",
-    // strings associated with generic rootkits in general
-      "r00tkit","r00tk1t","module_hide"
-    };
+	if (!base || needle_len > size)
+		return false;
 
-    // data check.. 
-    for (x = 0; x < (sizeof(data_str) / sizeof(char *)); x++)
-    {
-        if(memsrch(addr, len, (char *)data_str[x], strlen((char *)data_str[x])) != 0)
-        {
-            return -1;
-        }
-    }
-    return 0;
+	for (offset = 0; offset + needle_len <= size; offset++) {
+		char sample[64];
+
+		if (needle_len > sizeof(sample))
+			return false;
+		if (!copy_from_kernel_nofault(sample, memory + offset, needle_len) &&
+		    !memcmp(sample, needle, needle_len))
+			return true;
+	}
+	return false;
 }
 
-void look_for_lkm(void)
+static bool rkspotter_check_module(struct module *mod)
 {
-    struct module *mahjool; 
-    struct kobject kobj; 
-    unsigned long addy; 
+	bool suspect = false;
+	int i;
 
-    for (addy = MODULES_VADDR; addy < MODULES_END; (addy = (addy + 4096)))
-    { 
-        // does this memory region belong to a module? 
-        if(__module_address(addy) != 0)
-        { 
-            mahjool = __module_address(addy);
+	if (READ_ONCE(mod->list.next) == LIST_POISON1 ||
+	    READ_ONCE(mod->list.prev) == LIST_POISON2 ||
+	    READ_ONCE(mod->list.next) == READ_ONCE(mod->list.prev)) {
+		pr_warn("rkspotter: module %s has suspicious list links\n", mod->name);
+		suspect = true;
+	}
+	if (!mod->mkobj.kobj.state_in_sysfs) {
+		pr_warn("rkspotter: module %s is absent from sysfs\n", mod->name);
+		suspect = true;
+	}
 
-            //// Here are some LKM checks..
-            ///  ==========================
-            ///
-            ///  simple integrity checks first.. 
-            ///
-            //   we assume that all LKM were minted together in a McFactory and should look alike and 
-            //   be in a good and orderly state so we check if this LKM has anything suspect going on 
-            //   that might show it's 'not like the others' 
+	for (i = 0; i < ARRAY_SIZE(suspicious_signatures); i++) {
+		char signature[64];
 
-            //// Hidden modules: 
-            // 
-            //   some modules are hidden from /proc/modules & tools like 'lsmod' using code like:
-            //
-            //      list_del_init(&__this_module.list);   
-            //
-            //   list_del_init simply juggles some pointers about which we can look for.. 
-            // 
-            if(mahjool->list.next == mahjool->list.prev)
-            {
-                 printk("rks: module (@%px - size: %d / %s) suspect list ptrs\n",
-                                                                    (void *)mahjool->core_layout.base, 
-                                                                           mahjool->core_layout.size,
-                                                                                        mahjool->name);
-            }
-
-            //  some modules are hidden (/proc & lsmod etc) with code like: 
-            //
-            //    list_del(&THIS_MODULE->list); 
-            //   
-            //  list_del marks prev and next pointers with a (non null) 'poison' value
-            //
-            if((mahjool->list.next == LIST_POISON1) || (mahjool->list.prev == LIST_POISON2)) 
-            {
-                printk("rks: module (@%px - size: %d / %s) has poison pointer in list\n", 
-                                                                      (void *)mahjool->core_layout.base,
-                                                                            mahjool->core_layout.size,
-                                                                                        mahjool->name); 
-            }
-
-            //
-            //   some modules are further hidden from sysfs (/sys/modules/) with code like:
-            //
-            //      kobject_del(&THIS_MODULE->mkobj.kobj);
-            //
-            //   the underlying __kobject_del does a bunch of cleanup and sets a marker so lets look for 
-            //   the marker.. 
-            // 
-            kobj = mahjool->mkobj.kobj; 
-            if(kobj.state_in_sysfs == 0)
-            {
-                printk("rks: module (@%px - size: %d / %s) suspect sysfs state\n", 
-                                                             (void *)mahjool->core_layout.base,
-                                                                     mahjool->core_layout.size,
-                                                                                 mahjool->name);
-            }
-
-            //// Structure misc weirdness: 
-            //  
-            //   something that a couple of rootkits do is to:  
-            //
-            //      kfree(THIS_MODULE->sect_attrs);
-            //      THIS_MODULE->sect_attrs = NULL;
-            //
-            //   (or possibly the same/similar with the notes_attrs)
-            // 
-            if((mahjool->sect_attrs == NULL) || (mahjool->notes_attrs == NULL))
-            {
-                printk("rks: module (@%px - size: %d / %s)  suspect attrs state\n", 
-                                                              (void *)mahjool->core_layout.base,
-                                                                      mahjool->core_layout.size, 
-                                                                                  mahjool->name);
-            }
-
-            //// now some code check..
-            //
-            // TODO => add more
-            //
-	    if(lkm_code_check(mahjool->core_layout.base, mahjool->core_layout.text_size) != 0)
-	    {
-		printk("rks: module %s contains suspect instruction sequence\n", mahjool->name);
-	    }
-
-            //// now some data checks..
-            // 
-            if(lkm_data_check((mahjool->core_layout.base + mahjool->core_layout.text_size), 
-                                  (mahjool->core_layout.ro_size - mahjool->core_layout.text_size)) != 0)
-            {
-                // we filter out our own module by comparing address 
-                if(THIS_MODULE->core_layout.base != mahjool->core_layout.base)
-                {
-                    printk("rks: module %s contains suspect data sequence\n", mahjool->name);
-                }
-            }
- 
-            addy = (addy + mahjool->core_layout.size);
-        }
-    
-    }   
-    //
-    // check sys_call_table next
-    //                                
-    if(sct != 0)
-    {
-        // check if sys_call_table contains any pointers to a module for a couple
-        // of often hooked functions.. 
-        if((sct[__NR_open] > MODULES_VADDR) && 
-                             (sct[__NR_open] < MODULES_END))
-        {
-            printk("rks: syscall table sys_open entry points to a module!\n");
-        }
-        if((sct[__NR_getdents] > MODULES_VADDR) && 
-                             (sct[__NR_getdents] < MODULES_END))
-        {
-            printk("rks: syscall table sys_getdents entry points to a module!\n");
-        }
-        if((sct[__NR_getdents64] > MODULES_VADDR) && 
-                             (sct[__NR_getdents64] < MODULES_END))
-        {
-            printk("rks: syscall table sys_getdents64 entry points to a module!\n");
-        }
-        if((sct[__NR_readlink] > MODULES_VADDR) && 
-                              (sct[__NR_readlink] < MODULES_END))
-        {
-            printk("rks: syscall table sys_readlink entry points to a module!\n");
-        }
-    }
+		decode_signature(&suspicious_signatures[i], signature);
+		if (rkspotter_mem_contains(mod->mem[MOD_RODATA].base,
+					  mod->mem[MOD_RODATA].size,
+					  signature) ||
+		    rkspotter_mem_contains(mod->mem[MOD_DATA].base,
+					  mod->mem[MOD_DATA].size,
+					  signature)) {
+			pr_warn("rkspotter: module %s contains signature %s\n",
+				mod->name, signature);
+			suspect = true;
+			break;
+		}
+	}
+	return suspect;
 }
 
-void look_for_userspace(void)
+static unsigned long rkspotter_scan(void)
 {
-    int x;
-    int pmd = PID_MAX_DEFAULT; 
-    struct task_struct *ts; 
-    char tsk[TASK_COMM_LEN]; 
-    struct mm_struct *emem;
-    void *yabba;
-    char *ldp = "LD_PRELOAD";
-    //
-    // a check for userspace rootkits working via LD_PRELOAD in the environment 
-    if(arvm != 0)
-    {
-        for(x = 2; x < pmd; x++)
-        {
-            ts = pid_task(find_vpid(x), PIDTYPE_PID); 
-            if(ts != 0)
-            {
-                get_task_comm(tsk, ts);
-                task_lock(ts);
-                if(ts->mm != 0)
-                {
-                    emem = ts->mm;
-                    // don't get out of bed for less than 16 bytes 
-                    if((emem->env_end - emem->env_start) > 16)
-                    {
-                        yabba = kmalloc((emem->env_end - emem->env_start), GFP_KERNEL);
+	struct module *last = NULL;
+	unsigned long address;
+	unsigned long modules_start;
+	unsigned long modules_end;
 
-                        // fetch the environment/envp for the process
-                        arvm(ts, emem, emem->env_start, yabba, (emem->env_end - emem->env_start),  
-                                                                                       FOLL_FORCE);
-                        // search for the LD_PRELOAD environment variable 
-                        if(memsrch(yabba, (emem->env_end - emem->env_start), ldp, strlen(ldp)) != 0)
-                        {
-                            printk("rks: process %d (%s) has LD_PRELOAD environment var\n", x, tsk);
-                        }
+	modules_start = ALIGN_DOWN((unsigned long)THIS_MODULE->mem[MOD_TEXT].base,
+				   SZ_2G);
+	modules_end = modules_start + SZ_2G;
+	for (address = modules_start; address < modules_end; address += PAGE_SIZE) {
+		struct module *mod = module_address_fn(address);
 
-                        kfree(yabba);
-                    }
-                }
-                task_unlock(ts);
-            }
-        }
-    }
-    else
-    {
-        printk("rks: not found __access_remote_vm so skipping environment check\n");
-    }
-
-    // 
-    //   there may be entries in a global ld preload file
-    // 
-    if (get_filesz_by_path("/etc/ld.so.preload") > 0)
-    {
-        printk("rks: found /etc/ld.so.preload exists and is not empty\n");
-    }
+		if (!mod || mod == last)
+			continue;
+		last = mod;
+		if (mod != THIS_MODULE && rkspotter_check_module(mod))
+			suspect_modules++;
+	}
+	scan_runs++;
+	return suspect_modules;
 }
 
-int init_module(void)
+static unsigned long rkspotter_iee_callback(enum iee_security_tool_id id,
+		enum iee_security_reason reason, unsigned long event, void *context)
 {
-    // use kprobe hack to find a couple of addresses first
-    sct = kprobe_find_sct();
-    arvm = (void *)kprobe_find_arvm();
-
-    look_for_lkm();
-    look_for_userspace();
- 
-    return 0;
+	if (id != IEE_SECURITY_TOOL_RKSPOTTER ||
+	    reason != IEE_SECURITY_REASON_CALLBACK || event)
+		return -EINVAL;
+	return 0;
 }
 
-void cleanup_module(void)
+static int __init rkspotter_init(void)
 {
+	unsigned long result;
+	int ret;
 
+	module_address_fn = rkspotter_resolve("__module_address");
+	if (!module_address_fn)
+		return -ENOENT;
+
+	ret = iee_security_tool_register(IEE_SECURITY_TOOL_RKSPOTTER,
+			IEE_SECURITY_TOOL_CALLBACK, 0, rkspotter_iee_callback,
+			THIS_MODULE);
+	if (ret)
+		return ret;
+
+	result = iee_security_tool_invoke(IEE_SECURITY_TOOL_RKSPOTTER, 0, NULL);
+	if ((long)result < 0) {
+		iee_security_tool_unregister(IEE_SECURITY_TOOL_RKSPOTTER,
+					     rkspotter_iee_callback);
+		return result;
+	}
+	/* The address-space walk may fault and therefore runs after IEE returns. */
+	result = rkspotter_scan();
+	pr_info("rkspotter: IEE-authorized scan complete, suspects=%lu\n", result);
+	return 0;
 }
 
-MODULE_AUTHOR("linuxthor");
+static void __exit rkspotter_exit(void)
+{
+	iee_security_tool_unregister(IEE_SECURITY_TOOL_RKSPOTTER,
+				     rkspotter_iee_callback);
+	pr_info("rkspotter: unloaded, scans=%lu suspects=%lu\n",
+		scan_runs, suspect_modules);
+}
+
+module_init(rkspotter_init);
+module_exit(rkspotter_exit);
+
+MODULE_AUTHOR("linuxthor; RISC-V IEE port");
+MODULE_DESCRIPTION("IEE-backed hidden and suspicious module detector");
 MODULE_LICENSE("GPL");
