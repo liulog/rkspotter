@@ -1,385 +1,366 @@
-/* 
- * rkspotter
- *
- * Copyright (c) 2020 linuxthor.
- * 
- * This program is free software: you can redistribute it and/or modify  
- * it under the terms of the GNU General Public License as published by  
- * the Free Software Foundation, version 3. Or give it to the rag and 
- * bone man because I love eels.
- *
- * This program is distributed in the hope that it will be useful, but 
- * WITHOUT ANY WARRANTY; without even the implied warranty of your 
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License 
- * along with this program. If not, see <http://www.gnu.org/licenses/>
- */
+// SPDX-License-Identifier: GPL-2.0
+/* RISC-V IEE port: query module_memory's address tree; never probe holes. */
+#ifdef CONFIG_IEE_RKSPOTTER
 
-#include <linux/module.h>
+#include <linux/align.h>
+#include <linux/compiler.h>
+#include <linux/errno.h>
+#include <linux/iee_security.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
-#include <linux/fs.h>
-#include <linux/mm.h>
-#include <linux/uio.h>  
-#include <linux/namei.h>
-#include <linux/mount.h>
-#include <linux/slab.h>
-#include <linux/vmalloc.h>
-#include <linux/uaccess.h>
-#include <linux/pagemap.h>
-#include <linux/kprobes.h>
-#include <linux/sched/task.h>
+#include <linux/minmax.h>
+#include <linux/module.h>
+#include <linux/poison.h>
 
-// sys_call_table
-unsigned long *sct;
-// __access_remote_vm 
-static int (*arvm)(struct task_struct *tsk, struct mm_struct *mm, unsigned long addr, 
-                                                          void *buf, int len, int write);
- 
-void *memsrch(const void *s1, size_t len1, const void *s2, size_t len2)
+#include <asm/haoc/iee-def.h>
+#include <asm/page.h>
+#include <asm/unistd.h>
+
+#define RKSPOTTER_MAX_PAGES_PER_IRQ 64U
+#define RKSPOTTER_SIG_MAX 32U
+
+static unsigned int pages_per_irq = 64;
+module_param(pages_per_irq, uint, 0444);
+MODULE_PARM_DESC(pages_per_irq, "Page work budget per successful IRQ (1..64)");
+
+static unsigned long cursor;
+static unsigned long findings;
+static unsigned long scan_runs;
+
+static int scan_runs_get(char *buffer, const struct kernel_param *kp)
 {
-    if (!len2)
-    {
-        return (void *)s1;
-    }
-    while (len1 >= len2) 
-    {
-        len1--;
-        if (!memcmp(s1, s2, len2))
-        {
-            return (void *)s1;
-        }
-        s1++;
-    }
-    return NULL;
+	return scnprintf(buffer, PAGE_SIZE, "%lu\n",
+			 READ_ONCE(*(unsigned long *)kp->arg));
 }
 
-// I think this is a pretty unclean way to get this information but the code is small ;) 
-int get_filesz_by_path(const char *pathname)
+static int findings_get(char *buffer, const struct kernel_param *kp)
 {
-    struct path path;
-    struct inode *inode;
-    int size;
-
-    size=-1;
-    if (kern_path(pathname, 0, &path) == 0)
-    {
-        inode = path.dentry->d_inode;
-        size = inode->i_size;
-        mark_inode_dirty_sync(inode);
-        path_put(&path);
-    }
-    return size;
+	return scnprintf(buffer, PAGE_SIZE, "0x%lx\n",
+			 READ_ONCE(*(unsigned long *)kp->arg));
 }
 
-static struct kprobe sct_kp = { 
+static const struct kernel_param_ops scan_runs_ops = { .get = scan_runs_get };
+static const struct kernel_param_ops findings_ops = { .get = findings_get };
+module_param_cb(scan_runs, &scan_runs_ops, &scan_runs, 0444);
+module_param_cb(findings, &findings_ops, &findings, 0444);
+
+enum {
+	RK_LIST = BIT(0),
+	RK_SYSFS = BIT(1),
+	RK_ATTRS = BIT(2),
+	RK_SIG = BIT(3),
+	RK_SYSCALL = BIT(4),
+	RK_INCOMPLETE = BIT(5),
 };
-unsigned long *kprobe_find_sct(void)
-{
-    unsigned long *table; 
 
-    sct_kp.symbol_name = "sys_call_table";
-    register_kprobe(&sct_kp);
-    table = (void *)sct_kp.addr;
-    if(table != 0)
-    {
-        //printk("rks: sys_call_table at %px\n",(void *)table);
-    } 
-    else
-    {
-        //printk("rks: sys_call_table not found\n"); 
-    }
-    return table;
-}
-
-static struct kprobe arvm_kp = { 
+struct encoded_signature {
+	const u8 *data;
+	u8 len;
 };
-unsigned long *kprobe_find_arvm(void)
-{
-    unsigned long *access_rem_vm; 
 
-    arvm_kp.symbol_name = "__access_remote_vm";
-    if(register_kprobe(&arvm_kp) == 0)
-             unregister_kprobe(&arvm_kp); 
-    access_rem_vm = (void *)arvm_kp.addr;
-    if(access_rem_vm != 0)
-    {
-        //printk("rks: __access_remote_vm at %px\n",(void *)access_rem_vm);
-    } 
-    else
-    {
-        //printk("rks: __access_remote_vm not found\n"); 
-    }
-    return access_rem_vm;
+static const u8 signature_0[] = {
+	0x8a, 0xd7, 0xc0, 0xd5, 0xd1, 0xcc, 0xc9, 0xc0, 0x8a, 0xd7, 0xc0, 0xd5,
+	0xd1, 0xcc, 0xc9, 0xc0,
+};
+
+static const u8 signature_1[] = {
+	0xee, 0xed, 0xea, 0xea, 0xee, 0xfa,
+};
+
+static const u8 signature_2[] = {
+	0xcc, 0xd6, 0xfa, 0xd5, 0xd7, 0xca, 0xc6, 0xfa, 0xcc, 0xcb, 0xd3, 0xcc,
+	0xd6, 0xcc, 0xc7, 0xc9, 0xc0,
+};
+
+static const u8 signature_3[] = {
+	0xf7, 0xea, 0xea, 0xf1, 0xee, 0xec, 0xf1, 0x85, 0xd6, 0xdc, 0xd6, 0xc6,
+	0xc4, 0xc9, 0xc9, 0xfa, 0xd1, 0xc4, 0xc7, 0xc9, 0xc0,
+};
+
+static const u8 signature_4[] = {
+	0xf7, 0xea, 0xea, 0xf1, 0xee, 0xec, 0xf1, 0x85, 0xd6, 0xdc, 0xd6, 0xfa,
+	0xc6, 0xc4, 0xc9, 0xc9, 0xfa, 0xd1, 0xc4, 0xc7, 0xc9, 0xc0,
+};
+
+static const u8 signature_5[] = {
+	0xd0, 0xcb, 0xfa, 0xcd, 0xcc, 0xcf, 0xc4, 0xc6, 0xce, 0xfa, 0xc0, 0xdd,
+	0xc0, 0xc6, 0xd3, 0xc0,
+};
+
+static const u8 signature_6[] = {
+	0xe2, 0xcc, 0xd3, 0xcc, 0xcb, 0xc2, 0x85, 0xd7, 0x95, 0x95, 0xd1,
+};
+
+static const u8 signature_7[] = {
+	0xfe, 0x9a, 0xf8, 0x85, 0xf6, 0xe6, 0xf1, 0x9f,
+};
+
+static const u8 signature_8[] = {
+	0xe0, 0xdd, 0xc4, 0xc8, 0xd5, 0xc9, 0xc0, 0x85, 0xf7, 0xca, 0xca, 0xd1,
+	0xce, 0xcc, 0xd1,
+};
+
+static const u8 signature_9[] = {
+	0xc2, 0xcc, 0xd3, 0xc0, 0xc8, 0xc0, 0xd7, 0xca, 0xca, 0xd1,
+};
+
+static const u8 signature_10[] = {
+	0x85, 0xc9, 0xcc, 0xc9, 0xdc, 0xca, 0xc3, 0xd1, 0xcd, 0xc0, 0xd3, 0xc4,
+	0xc9, 0xc9, 0xc0, 0xdc,
+};
+
+static const u8 signature_11[] = {
+	0x85, 0xd0, 0x85, 0xd2, 0xc4, 0xcb, 0xd1, 0x85, 0xd1, 0xca, 0x85, 0xcd,
+	0xcc, 0xc1, 0xc0,
+};
+
+static const u8 signature_12[] = {
+	0xc1, 0xcc, 0xc4, 0xc8, 0xca, 0xd7, 0xd5, 0xcd, 0xcc, 0xcb, 0xc0, 0xfa,
+};
+
+static const u8 signature_13[] = {
+	0xc8, 0x95, 0xcb, 0xc4, 0xc1,
+};
+
+static const u8 signature_14[] = {
+	0xe9, 0xee, 0xe8, 0x85, 0xd7, 0xca, 0xca, 0xd1, 0xce, 0xcc, 0xd1,
+};
+
+static const u8 signature_15[] = {
+	0xfa, 0xc7, 0xc4, 0xc6, 0xce, 0xc1, 0xca, 0xca, 0xd7, 0xfa, 0xd0, 0xd6,
+	0xc0, 0xd7,
+};
+
+static const u8 signature_16[] = {
+	0x8a, 0xcd, 0xca, 0xc8, 0xc0, 0x8a, 0xcd, 0xc4, 0xdd, 0xca, 0xd7,
+};
+
+static const u8 signature_17[] = {
+	0x8a, 0xc0, 0xd1, 0xc6, 0x8a, 0xd6, 0xc0, 0xc6, 0xd7, 0xc0, 0xd1, 0xd6,
+	0xcd, 0xc4, 0xc1, 0xca, 0xd2,
+};
+
+static const u8 signature_18[] = {
+	0xcd, 0xcc, 0xc1, 0xc0, 0x85, 0xd5, 0xcc, 0xc1, 0x85, 0xc6, 0xca, 0xc8,
+	0xc8, 0xc4, 0xcb, 0xc1,
+};
+
+static const u8 signature_19[] = {
+	0xcd, 0xcc, 0xc1, 0xc0, 0x85, 0xc3, 0xcc, 0xc9, 0xc0, 0x85, 0xc6, 0xca,
+	0xc8, 0xc8, 0xc4, 0xcb, 0xc1,
+};
+
+static const u8 signature_20[] = {
+	0xc4, 0xd6, 0xc8, 0xfa, 0xcd, 0xca, 0xca, 0xce, 0xfa, 0xd7, 0xc0, 0xc8,
+	0xca, 0xd3, 0xc0, 0xfa, 0xc4, 0xc9, 0xc9,
+};
+
+static const u8 signature_21[] = {
+	0xd7, 0x95, 0x95, 0xd1, 0xce, 0xcc, 0xd1,
+};
+
+static const u8 signature_22[] = {
+	0xd7, 0x95, 0x95, 0xd1, 0xce, 0x94, 0xd1,
+};
+
+static const u8 signature_23[] = {
+	0xc8, 0xca, 0xc1, 0xd0, 0xc9, 0xc0, 0xfa, 0xcd, 0xcc, 0xc1, 0xc0,
+};
+
+static const struct encoded_signature suspicious_signatures[] = {
+	{ signature_0, ARRAY_SIZE(signature_0) },
+	{ signature_1, ARRAY_SIZE(signature_1) },
+	{ signature_2, ARRAY_SIZE(signature_2) },
+	{ signature_3, ARRAY_SIZE(signature_3) },
+	{ signature_4, ARRAY_SIZE(signature_4) },
+	{ signature_5, ARRAY_SIZE(signature_5) },
+	{ signature_6, ARRAY_SIZE(signature_6) },
+	{ signature_7, ARRAY_SIZE(signature_7) },
+	{ signature_8, ARRAY_SIZE(signature_8) },
+	{ signature_9, ARRAY_SIZE(signature_9) },
+	{ signature_10, ARRAY_SIZE(signature_10) },
+	{ signature_11, ARRAY_SIZE(signature_11) },
+	{ signature_12, ARRAY_SIZE(signature_12) },
+	{ signature_13, ARRAY_SIZE(signature_13) },
+	{ signature_14, ARRAY_SIZE(signature_14) },
+	{ signature_15, ARRAY_SIZE(signature_15) },
+	{ signature_16, ARRAY_SIZE(signature_16) },
+	{ signature_17, ARRAY_SIZE(signature_17) },
+	{ signature_18, ARRAY_SIZE(signature_18) },
+	{ signature_19, ARRAY_SIZE(signature_19) },
+	{ signature_20, ARRAY_SIZE(signature_20) },
+	{ signature_21, ARRAY_SIZE(signature_21) },
+	{ signature_22, ARRAY_SIZE(signature_22) },
+	{ signature_23, ARRAY_SIZE(signature_23) },
+};
+
+static __always_inline bool
+rkspotter_signatures(const u8 *data, unsigned int length)
+{
+	unsigned int i, j, k;
+
+	for (i = 0; i < ARRAY_SIZE(suspicious_signatures); i++) {
+		const struct encoded_signature *sig = &suspicious_signatures[i];
+
+		if (length < sig->len)
+			continue;
+		for (j = 0; j <= length - sig->len; j++) {
+			for (k = 0; k < sig->len; k++)
+				if (READ_ONCE(data[j + k]) != (sig->data[k] ^ 0xa5))
+					break;
+			if (k == sig->len)
+				return true;
+		}
+	}
+	return false;
 }
 
-int lkm_code_check(unsigned long *addr, int len)
+/* Called only for a live core module found in mod_tree, under RCU + kset lock. */
+static __always_inline int
+rkspotter_inspect_region(const struct iee_security_context *ctx,
+			 struct module *mod, unsigned long addr,
+			 unsigned int budget, unsigned int *used,
+			 unsigned long *next_addr)
 {
-    // code signatures.. 
-    //
-    // 0f 22 c0            mov    %rax,%cr0
-    char cr0_rax[3] = {'\x0f','\x22','\xc0'};
+	unsigned long next = (unsigned long)READ_ONCE(mod->list.next);
+	unsigned long prev = (unsigned long)READ_ONCE(mod->list.prev);
+	int reason = 0;
+	int type;
 
-    if(memsrch(addr, len, cr0_rax, 3) != 0)
-    {
-        return -1; 
-    }
-    return 0; 
+	if (next == (unsigned long)LIST_POISON1 ||
+	    prev == (unsigned long)LIST_POISON2 ||
+	    (next == prev && next != (unsigned long)ctx->modules))
+		reason |= RK_LIST;
+	if (!mod->mkobj.kobj.state_in_sysfs)
+		reason |= RK_SYSFS;
+#ifdef CONFIG_KALLSYMS
+	/* Missing notes_attrs alone is normal for modules without ELF notes. */
+	if (!READ_ONCE(mod->sect_attrs))
+		reason |= RK_ATTRS;
+#endif
+	for (type = MOD_TEXT; type <= MOD_RO_AFTER_INIT; type++) {
+		const struct module_memory *mem = &mod->mem[type];
+		unsigned long base = (unsigned long)READ_ONCE(mem->base);
+		unsigned long size = READ_ONCE(mem->size);
+		unsigned long end;
+		unsigned int pages = 0;
+
+		if (!size || addr < base || addr - base >= size)
+			continue;
+		if (base < ctx->modules_start || base >= ctx->modules_end ||
+		    size > ctx->modules_end - base)
+			return reason | RK_INCOMPLETE;
+		end = base + size;
+		/* No payload reads for text or the checker's own data. */
+		if (type == MOD_TEXT || mod == THIS_MODULE) {
+			*next_addr = ALIGN(end, PAGE_SIZE);
+			return reason;
+		}
+		/* Inspect this region once, stopping at the IRQ's remaining budget. */
+		while (pages < budget && addr < end) {
+			unsigned int length;
+
+			/* Keep cross-page signatures within the same live region. */
+			length = min_t(unsigned long, PAGE_SIZE + RKSPOTTER_SIG_MAX - 1,
+				       end - addr);
+			if (rkspotter_signatures((const u8 *)addr, length))
+				reason |= RK_SIG;
+			pages++;
+			addr += PAGE_SIZE;
+		}
+		*used = pages;
+		*next_addr = addr;
+		return reason;
+	}
+	return reason | RK_INCOMPLETE;
 }
 
-int lkm_data_check(unsigned long *addr, int len)
+static const unsigned int watched_syscalls[] = {
+	__NR_openat, __NR_getdents64, __NR_readlinkat,
+};
+
+static __always_inline int
+rkspotter_syscalls(const struct iee_security_context *ctx)
 {
-    int x;
+	unsigned int i;
+	int result = 0;
 
-    // data signatures..
-    //
-    char *data_str[24] = {
-    // strings associated with (unmodified) reptile rootkit    
-      "/reptile/reptile","KHOOK_","is_proc_invisible",
-    // strings associated with (unmodified) rootfoo rootkit
-      "ROOTKIT syscall_table", "ROOTKIT sys_call_table", "un_hijack_execve",
-    // strings associated with (unmodified) sutekh rootkit
-      "Giving r00t", "[?] SCT:", "Example Rootkit",
-    // strings associated with (unmodified) lilyofthevalley rootkit
-      "givemeroot"," lilyofthevalley"," u want to hide",
-    // strings associated with (unmodified) diamorphine rootkit
-      "diamorphine_","m0nad","LKM rootkit",
-    // strings associated with (unmodified) honeypot bears rootkit
-      "_backdoor_user","/home/haxor","/etc/secretshadow",
-    // strings associated with (unmodified) nuk3gh0stbeta rootkit
-      "hide pid command","hide file command","asm_hook_remove_all",
-    // strings associated with generic rootkits in general
-      "r00tkit","r00tk1t","module_hide"
-    };
+	for (i = 0; i < ARRAY_SIZE(watched_syscalls); i++) {
+		unsigned long entry;
 
-    // data check.. 
-    for (x = 0; x < (sizeof(data_str) / sizeof(char *)); x++)
-    {
-        if(memsrch(addr, len, (char *)data_str[x], strlen((char *)data_str[x])) != 0)
-        {
-            return -1;
-        }
-    }
-    return 0;
+		if (watched_syscalls[i] >= ctx->syscall_count)
+			continue;
+		entry = (unsigned long)READ_ONCE(ctx->syscalls[watched_syscalls[i]]);
+		if (entry >= ctx->modules_start && entry < ctx->modules_end)
+			result |= RK_SYSCALL;
+	}
+	return result;
 }
 
-void look_for_lkm(void)
+static int __iee_code notrace
+rkspotter_check(const struct iee_security_context *ctx)
 {
-    struct module *mahjool; 
-    struct kobject kobj; 
-    unsigned long addy; 
+	unsigned int budget = READ_ONCE(pages_per_irq);
+	unsigned long addr = cursor;
+	unsigned int remaining = budget;
+	int result = 0;
 
-    for (addy = MODULES_VADDR; addy < MODULES_END; (addy = (addy + 4096)))
-    { 
-        // does this memory region belong to a module? 
-        if(__module_address(addy) != 0)
-        { 
-            mahjool = __module_address(addy);
+	if (!ctx->module_lookup || ctx->modules_start >= ctx->modules_end ||
+	    !IS_ALIGNED(ctx->modules_start, PAGE_SIZE) ||
+	    !IS_ALIGNED(ctx->modules_end, PAGE_SIZE))
+		return RK_INCOMPLETE;
+	if (addr < ctx->modules_start || addr >= ctx->modules_end)
+		addr = ctx->modules_start;
 
-            //// Here are some LKM checks..
-            ///  ==========================
-            ///
-            ///  simple integrity checks first.. 
-            ///
-            //   we assume that all LKM were minted together in a McFactory and should look alike and 
-            //   be in a good and orderly state so we check if this LKM has anything suspect going on 
-            //   that might show it's 'not like the others' 
+	/* Reuse a hit only inside this RCU section; retain just the next address. */
+	while (remaining && addr < ctx->modules_end) {
+		struct module *mod = ctx->module_lookup(addr);
+		unsigned long next_addr = addr + PAGE_SIZE;
+		unsigned int used = 1;
 
-            //// Hidden modules: 
-            // 
-            //   some modules are hidden from /proc/modules & tools like 'lsmod' using code like:
-            //
-            //      list_del_init(&__this_module.list);   
-            //
-            //   list_del_init simply juggles some pointers about which we can look for.. 
-            // 
-            if(mahjool->list.next == mahjool->list.prev)
-            {
-                 printk("rks: module (@%px - size: %d / %s) suspect list ptrs\n",
-                                                                    (void *)mahjool->core_layout.base, 
-                                                                           mahjool->core_layout.size,
-                                                                                        mahjool->name);
-            }
-
-            //  some modules are hidden (/proc & lsmod etc) with code like: 
-            //
-            //    list_del(&THIS_MODULE->list); 
-            //   
-            //  list_del marks prev and next pointers with a (non null) 'poison' value
-            //
-            if((mahjool->list.next == LIST_POISON1) || (mahjool->list.prev == LIST_POISON2)) 
-            {
-                printk("rks: module (@%px - size: %d / %s) has poison pointer in list\n", 
-                                                                      (void *)mahjool->core_layout.base,
-                                                                            mahjool->core_layout.size,
-                                                                                        mahjool->name); 
-            }
-
-            //
-            //   some modules are further hidden from sysfs (/sys/modules/) with code like:
-            //
-            //      kobject_del(&THIS_MODULE->mkobj.kobj);
-            //
-            //   the underlying __kobject_del does a bunch of cleanup and sets a marker so lets look for 
-            //   the marker.. 
-            // 
-            kobj = mahjool->mkobj.kobj; 
-            if(kobj.state_in_sysfs == 0)
-            {
-                printk("rks: module (@%px - size: %d / %s) suspect sysfs state\n", 
-                                                             (void *)mahjool->core_layout.base,
-                                                                     mahjool->core_layout.size,
-                                                                                 mahjool->name);
-            }
-
-            //// Structure misc weirdness: 
-            //  
-            //   something that a couple of rootkits do is to:  
-            //
-            //      kfree(THIS_MODULE->sect_attrs);
-            //      THIS_MODULE->sect_attrs = NULL;
-            //
-            //   (or possibly the same/similar with the notes_attrs)
-            // 
-            if((mahjool->sect_attrs == NULL) || (mahjool->notes_attrs == NULL))
-            {
-                printk("rks: module (@%px - size: %d / %s)  suspect attrs state\n", 
-                                                              (void *)mahjool->core_layout.base,
-                                                                      mahjool->core_layout.size, 
-                                                                                  mahjool->name);
-            }
-
-            //// now some code check..
-            //
-            // TODO => add more
-            //
-	    if(lkm_code_check(mahjool->core_layout.base, mahjool->core_layout.text_size) != 0)
-	    {
-		printk("rks: module %s contains suspect instruction sequence\n", mahjool->name);
-	    }
-
-            //// now some data checks..
-            // 
-            if(lkm_data_check((mahjool->core_layout.base + mahjool->core_layout.text_size), 
-                                  (mahjool->core_layout.ro_size - mahjool->core_layout.text_size)) != 0)
-            {
-                // we filter out our own module by comparing address 
-                if(THIS_MODULE->core_layout.base != mahjool->core_layout.base)
-                {
-                    printk("rks: module %s contains suspect data sequence\n", mahjool->name);
-                }
-            }
- 
-            addy = (addy + mahjool->core_layout.size);
-        }
-    
-    }   
-    //
-    // check sys_call_table next
-    //                                
-    if(sct != 0)
-    {
-        // check if sys_call_table contains any pointers to a module for a couple
-        // of often hooked functions.. 
-        if((sct[__NR_open] > MODULES_VADDR) && 
-                             (sct[__NR_open] < MODULES_END))
-        {
-            printk("rks: syscall table sys_open entry points to a module!\n");
-        }
-        if((sct[__NR_getdents] > MODULES_VADDR) && 
-                             (sct[__NR_getdents] < MODULES_END))
-        {
-            printk("rks: syscall table sys_getdents entry points to a module!\n");
-        }
-        if((sct[__NR_getdents64] > MODULES_VADDR) && 
-                             (sct[__NR_getdents64] < MODULES_END))
-        {
-            printk("rks: syscall table sys_getdents64 entry points to a module!\n");
-        }
-        if((sct[__NR_readlink] > MODULES_VADDR) && 
-                              (sct[__NR_readlink] < MODULES_END))
-        {
-            printk("rks: syscall table sys_readlink entry points to a module!\n");
-        }
-    }
+		if (mod)
+			result |= rkspotter_inspect_region(ctx, mod, addr,
+						   remaining, &used, &next_addr);
+		remaining -= used;
+		addr = next_addr;
+	}
+	if (addr >= ctx->modules_end) {
+		result |= rkspotter_syscalls(ctx);
+		WRITE_ONCE(scan_runs, READ_ONCE(scan_runs) + 1);
+		addr = ctx->modules_start;
+	}
+	cursor = addr;
+	WRITE_ONCE(findings, READ_ONCE(findings) | result);
+	return result;
 }
 
-void look_for_userspace(void)
+static const struct iee_security_ops rkspotter_ops = {
+	.check = rkspotter_check,
+};
+
+static int __init rkspotter_init(void)
 {
-    int x;
-    int pmd = PID_MAX_DEFAULT; 
-    struct task_struct *ts; 
-    char tsk[TASK_COMM_LEN]; 
-    struct mm_struct *emem;
-    void *yabba;
-    char *ldp = "LD_PRELOAD";
-    //
-    // a check for userspace rootkits working via LD_PRELOAD in the environment 
-    if(arvm != 0)
-    {
-        for(x = 2; x < pmd; x++)
-        {
-            ts = pid_task(find_vpid(x), PIDTYPE_PID); 
-            if(ts != 0)
-            {
-                get_task_comm(tsk, ts);
-                task_lock(ts);
-                if(ts->mm != 0)
-                {
-                    emem = ts->mm;
-                    // don't get out of bed for less than 16 bytes 
-                    if((emem->env_end - emem->env_start) > 16)
-                    {
-                        yabba = kmalloc((emem->env_end - emem->env_start), GFP_KERNEL);
+	unsigned int i;
 
-                        // fetch the environment/envp for the process
-                        arvm(ts, emem, emem->env_start, yabba, (emem->env_end - emem->env_start),  
-                                                                                       FOLL_FORCE);
-                        // search for the LD_PRELOAD environment variable 
-                        if(memsrch(yabba, (emem->env_end - emem->env_start), ldp, strlen(ldp)) != 0)
-                        {
-                            printk("rks: process %d (%s) has LD_PRELOAD environment var\n", x, tsk);
-                        }
-
-                        kfree(yabba);
-                    }
-                }
-                task_unlock(ts);
-            }
-        }
-    }
-    else
-    {
-        printk("rks: not found __access_remote_vm so skipping environment check\n");
-    }
-
-    // 
-    //   there may be entries in a global ld preload file
-    // 
-    if (get_filesz_by_path("/etc/ld.so.preload") > 0)
-    {
-        printk("rks: found /etc/ld.so.preload exists and is not empty\n");
-    }
+	if (!pages_per_irq || pages_per_irq > RKSPOTTER_MAX_PAGES_PER_IRQ)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(suspicious_signatures); i++)
+		if (!suspicious_signatures[i].len ||
+		    suspicious_signatures[i].len > RKSPOTTER_SIG_MAX)
+			return -EINVAL;
+	return iee_security_register(&rkspotter_ops);
 }
 
-int init_module(void)
+static void __exit rkspotter_exit(void)
 {
-    // use kprobe hack to find a couple of addresses first
-    sct = kprobe_find_sct();
-    arvm = (void *)kprobe_find_arvm();
-
-    look_for_lkm();
-    look_for_userspace();
- 
-    return 0;
+	iee_security_unregister(&rkspotter_ops);
 }
 
-void cleanup_module(void)
-{
+module_init(rkspotter_init);
+module_exit(rkspotter_exit);
 
-}
-
-MODULE_AUTHOR("linuxthor");
+MODULE_AUTHOR("linuxthor; RISC-V IEE port");
+MODULE_DESCRIPTION("Incremental IEE module-tree rootkit detector");
 MODULE_LICENSE("GPL");
+
+#endif /* CONFIG_IEE_RKSPOTTER */
